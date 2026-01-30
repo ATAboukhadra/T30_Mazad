@@ -12,7 +12,7 @@ Usage:
     python fetch_all_players.py [--output FILE] [--sources SOURCE1,SOURCE2,...]
 
 To keep up-to-date, run periodically (e.g., weekly cron job):
-    0 0 * * 0 cd /path/to/project && python scripts/fetch_all_players.py
+    0 0 * * 0 cd /path/to/project && python scripts/data_prep/fetch_all_players.py
 """
 
 import argparse

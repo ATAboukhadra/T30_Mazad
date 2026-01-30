@@ -468,6 +468,9 @@ def _score_player(question: str, player: Dict) -> Tuple[int, float]:
     score = 0
     fame = float(player.get("fame_score") or 0.0)
 
+    # Normalize position string once for reuse.
+    position = str(player.get("position") or "").lower()
+
     nationality = str(player.get("nationality") or "").lower()
     if nationality and nationality in q:
         score += 3
@@ -495,25 +498,30 @@ def _score_player(question: str, player: Dict) -> Tuple[int, float]:
     if "english premier league" in q or "premier league" in q:
         league_targets.extend(["english premier league", "eng premier league", "premier league", "gb1"])
     if league and (league in q or any(t in league for t in league_targets)):
-        score += 2
+        score += 3
     if any(l in q for l in leagues) or any(any(t in l for t in league_targets) for l in leagues):
-        score += 2
+        score += 3
 
-    position = str(player.get("position") or "").lower()
     if position and position in q:
         score += 1
     if any(k in q for k in ["goalkeeper", "keeper"]):
         if "goal" in position or position == "gk":
-            score += 1
-    if any(k in q for k in ["defender", "defence", "defense", "cb", "lb", "rb"]):
-        if any(k in position for k in ["def", "cb", "lb", "rb"]):
-            score += 1
+            score += 2
+    if any(k in q for k in ["defender", "defence", "defense", "cb", "lb", "rb", "fullback", "full-back"]):
+        if any(k in position for k in ["def", "cb", "lb", "rb", "lwb", "rwb", "back"]):
+            score += 5
+        elif position:
+            score -= 1
     if any(k in q for k in ["midfielder", "midfield", "cm", "dm", "am"]):
-        if any(k in position for k in ["mid"]):
-            score += 1
+        if any(k in position for k in ["mid", "cm", "dm", "am"]):
+            score += 3
+        elif position:
+            score -= 1
     if any(k in q for k in ["forward", "striker", "winger", "attack"]):
         if any(k in position for k in ["for", "wing", "att", "st"]):
-            score += 1
+            score += 3
+        elif position:
+            score -= 1
 
     return score, fame
 
@@ -719,6 +727,7 @@ def run_pipeline(video_path: str, question: str,
                  slowdown: float = 1.0,
                  whisper_model: str = "medium",
                  player_db_path: Optional[str] = None,
+                 prompt_db_path: Optional[str] = None,
                  llm_provider: str = "gemini",
                  llm_model: Optional[str] = None,
                  use_gemini_asr: bool = True,
@@ -739,6 +748,8 @@ def run_pipeline(video_path: str, question: str,
     # Load player database
     player_db = None
     known_names = None
+    prompt_db = None
+    prompt_names = None
     if player_db_path and Path(player_db_path).exists():
         print(f"Loading player database from {player_db_path}...")
         player_db = load_player_database(player_db_path)
@@ -746,6 +757,13 @@ def run_pipeline(video_path: str, question: str,
         print(f"  Loaded {len(player_db)} players")
         if debug:
             print(f"[debug] known_names_unique={len(known_names)}")
+    if prompt_db_path and Path(prompt_db_path).exists():
+        print(f"Loading prompt database from {prompt_db_path}...")
+        prompt_db = load_player_database(prompt_db_path)
+        if debug:
+            print(f"[debug] prompt_db_players={len(prompt_db)}")
+    if debug:
+        print(f"[debug] prompt_db_path={prompt_db_path}")
     
     # Extract audio from video
     print(f"Extracting audio from {video_path}...")
@@ -770,11 +788,13 @@ def run_pipeline(video_path: str, question: str,
         print(f"Transcribing audio with {asr_method}...")
         try:
             prompt_names = known_names
+            if prompt_db:
+                prompt_names = list(set(p.get("name", "") for p in prompt_db.values() if p.get("name")))
             if use_gemini_asr is False and (question and question_filter):
                 prompt_names = _select_prompt_names(
                     question,
                     knowledge_path,
-                    player_db,
+                    prompt_db or player_db,
                     prompt_limit,
                     prompt_last_names,
                 )
@@ -882,8 +902,10 @@ def main():
                        help="Enable word-level timestamps (Whisper only)")
     parser.add_argument("--last-name-only", action="store_true",
                        help="Match transcript tokens to last names only")
-    parser.add_argument("--player-db", "-d", default="data/all_players.jsonl",
-                       help="Path to player database JSONL (default: data/all_players.jsonl)")
+    parser.add_argument("--player-db", "-d", default="data/players_enriched.jsonl",
+                       help="Path to player database JSONL (default: data/players_enriched.jsonl)")
+    parser.add_argument("--prompt-db", default="data/players_enriched.jsonl",
+                       help="Prompt database JSONL for ASR biasing (default: data/players_enriched.jsonl)")
     parser.add_argument("--llm", "-l", default="gemini",
                        choices=["openai", "ollama", "anthropic", "gemini"],
                        help="LLM provider (default: gemini)")
@@ -897,7 +919,7 @@ def main():
     parser.add_argument("--probs-output", help="Write ASR segment/token confidences JSON")
     parser.add_argument("--debug", action="store_true", help="Print debug info")
     parser.add_argument("--question-filter", action="store_true", help="Filter ASR prompt names by question")
-    parser.add_argument("--knowledge", default="knowledge.json", help="Knowledge base JSON/JSONL")
+    parser.add_argument("--knowledge", default="data/players_enriched.jsonl", help="Knowledge base JSON/JSONL")
     parser.add_argument("--prompt-limit", type=int, default=1000, help="Max names in ASR prompt")
     parser.add_argument("--prompt-last-names", action="store_true", help="Prompt with last names only")
     parser.add_argument("--prompt-output", help="Write Whisper initial prompt to a file")
@@ -922,6 +944,7 @@ def main():
         slowdown=args.slowdown,
         whisper_model=args.whisper_model,
         player_db_path=args.player_db,
+        prompt_db_path=args.prompt_db,
         llm_provider=args.llm,
         llm_model=args.llm_model,
         use_gemini_asr=(args.asr == "gemini"),

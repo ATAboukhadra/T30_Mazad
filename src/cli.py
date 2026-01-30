@@ -21,7 +21,7 @@ def main() -> int:
     parser.add_argument("question", help="Constraint question to evaluate")
     parser.add_argument(
         "--knowledge",
-        default="knowledge.json",
+        default="data/players_enriched.jsonl",
         help="Path to player knowledge JSON/JSONL",
     )
     parser.add_argument("--model", default="small", help="Whisper model size")
