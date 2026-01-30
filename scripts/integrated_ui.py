@@ -27,7 +27,13 @@ from werkzeug.utils import secure_filename
 
 from flask import Flask, jsonify, render_template_string, request, send_file, send_from_directory
 
-from stage2_match_names import load_players, process_pass
+from stage2_match_names import load_players, process_pass, fuzzy_match, normalize
+from verify_names import load_player_database, verify_with_llm
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
@@ -48,6 +54,11 @@ STATE: Dict[str, Any] = {
     "selections": {},
     "llm_results": {},
     "llm_client": None,
+    "llm_provider": "gemini",
+    "llm_model": None,
+    "player_db": None,
+    "players_by_name": None,
+    "all_names": None,
     "uploaded_videos": {},  # Store uploaded video paths
 }
 
@@ -501,6 +512,48 @@ HTML_TEMPLATE = """
             background: #444;
             border-radius: 3px;
         }
+        .search-box {
+            margin-top: 10px;
+            padding: 8px;
+            background: #10162a;
+            border: 1px solid #1f2742;
+            border-radius: 6px;
+        }
+        .search-input {
+            width: 100%;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid #2a2f45;
+            background: #0d1326;
+            color: #ddd;
+            font-size: 12px;
+        }
+        .search-results {
+            margin-top: 8px;
+            max-height: 140px;
+            overflow-y: auto;
+        }
+        .search-result {
+            padding: 6px 8px;
+            border-radius: 4px;
+            background: #141b33;
+            margin-bottom: 6px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .search-result:hover {
+            background: #1b2544;
+        }
+        .search-result-name {
+            font-weight: bold;
+            font-size: 12px;
+            color: #fff;
+        }
+        .search-result-meta {
+            font-size: 11px;
+            color: #9aa3c7;
+            margin-top: 2px;
+        }
         .suggestion {
             display: flex;
             justify-content: space-between;
@@ -874,6 +927,7 @@ HTML_TEMPLATE = """
                     Click "Run LLM Verification" to check players...
                 </div>
             </div>
+            <div class="asr-status" id="llm-summary" style="display:none;"></div>
             
             <div class="action-buttons">
                 <button class="btn-action btn-secondary" onclick="switchStage(2)">
@@ -893,6 +947,9 @@ HTML_TEMPLATE = """
         let tokensData = [];
         let selections = {};
         let llmResults = {};
+        let searchResults = {};
+        let searchQueries = {};
+        let searchTimers = {};
         
         // Initialize
         async function init() {
@@ -949,7 +1006,8 @@ HTML_TEMPLATE = """
         // Upload video file
         async function handleFile(file) {
             if (!file.type.startsWith('video/')) {
-                alert('Please select a video file');
+                const progressText = document.getElementById('progress-text');
+                progressText.textContent = '❌ Please select a video file';
                 return;
             }
             
@@ -986,26 +1044,22 @@ HTML_TEMPLATE = """
                                 loadVideo();
                             }, 500);
                         } else {
-                            progressText.textContent = '❌ Upload failed';
-                            alert('Upload failed: ' + (data.error || 'Unknown error'));
+                            progressText.textContent = '❌ Upload failed: ' + (data.error || 'Unknown error');
                         }
                     } else {
                         progressText.textContent = '❌ Upload failed';
-                        alert('Upload failed');
                     }
                 });
                 
                 xhr.addEventListener('error', () => {
                     progressText.textContent = '❌ Upload failed';
-                    alert('Upload failed due to network error');
                 });
                 
                 xhr.open('POST', '/api/upload-video');
                 xhr.send(formData);
                 
             } catch (error) {
-                progressText.textContent = '❌ Upload failed';
-                alert('Upload error: ' + error.message);
+                progressText.textContent = '❌ Upload failed: ' + error.message;
             }
         }
         
@@ -1022,23 +1076,23 @@ HTML_TEMPLATE = """
         
         // Change video
         function changeVideo() {
-            if (confirm('Change video? This will reset all progress.')) {
-                document.getElementById('video-upload-section').classList.remove('has-video');
-                document.getElementById('stage-tabs').style.display = 'none';
-                document.getElementById('stage1').style.display = 'none';
-                document.getElementById('file-input').value = '';
-                document.getElementById('upload-progress').style.display = 'none';
-                document.getElementById('progress-fill').style.width = '0%';
-                
-                // Reset state
-                tokensData = [];
-                selections = {};
-                llmResults = {};
-                document.getElementById('transcript-box').value = '';
-                
-                // Clear completed markers
-                document.querySelectorAll('.stage-tab').forEach(tab => tab.classList.remove('completed'));
-            }
+            document.getElementById('video-upload-section').classList.remove('has-video');
+            document.getElementById('stage-tabs').style.display = 'none';
+            document.getElementById('stage1').style.display = 'none';
+            document.getElementById('file-input').value = '';
+            document.getElementById('upload-progress').style.display = 'none';
+            document.getElementById('progress-fill').style.width = '0%';
+            
+            // Reset state
+            tokensData = [];
+            selections = {};
+            llmResults = {};
+            searchResults = {};
+            searchQueries = {};
+            document.getElementById('transcript-box').value = '';
+            
+            // Clear completed markers
+            document.querySelectorAll('.stage-tab').forEach(tab => tab.classList.remove('completed'));
         }
         
         // Stage switching
@@ -1097,7 +1151,10 @@ HTML_TEMPLATE = """
             const endTime = document.getElementById('end-time').value;
             
             if (!question.trim()) {
-                alert('Please enter a quiz question first!');
+                const status = document.getElementById('asr-status');
+                status.style.display = 'block';
+                status.className = 'asr-status';
+                status.textContent = '❌ Please enter a quiz question first.';
                 return;
             }
             
@@ -1138,9 +1195,7 @@ HTML_TEMPLATE = """
                     loadTokens();
                     
                     setTimeout(() => {
-                        if (confirm('ASR complete! Proceed to Stage 2 (Player Matching)?')) {
-                            switchStage(2);
-                        }
+                        switchStage(2);
                     }, 1500);
                 } else {
                     status.className = 'asr-status';
@@ -1169,7 +1224,10 @@ HTML_TEMPLATE = """
         async function applyTranscriptEdits() {
             const transcript = document.getElementById('transcript-box').value.trim();
             if (!transcript) {
-                alert('Please enter a transcript first.');
+                const status = document.getElementById('asr-status');
+                status.style.display = 'block';
+                status.className = 'asr-status';
+                status.textContent = '❌ Please enter a transcript first.';
                 return;
             }
             const response = await fetch('/api/set-transcript', {
@@ -1179,14 +1237,15 @@ HTML_TEMPLATE = """
             });
             const data = await response.json();
             if (data.status !== 'ok') {
-                alert('Failed to apply transcript: ' + (data.error || 'Unknown error'));
+                const status = document.getElementById('asr-status');
+                status.style.display = 'block';
+                status.className = 'asr-status';
+                status.textContent = '❌ Failed to apply transcript: ' + (data.error || 'Unknown error');
                 return;
             }
             await loadTokens();
             document.querySelector('[data-stage="1"]').classList.add('completed');
-            if (confirm('Transcript updated! Proceed to Stage 2 (Player Matching)?')) {
-                switchStage(2);
-            }
+            switchStage(2);
         }
         
         function renderTokens() {
@@ -1217,13 +1276,24 @@ HTML_TEMPLATE = """
                                 <div class="suggestion-info">
                                     <div class="suggestion-name">${escapeHtml(s.name)}</div>
                                     <div class="suggestion-meta">
-                                        ${s.player?.position || ''} 
+                                        ${s.player?.position || ''}
                                         ${s.player?.current_club ? '| ' + s.player.current_club : ''}
                                         ${s.player?.nationality ? '| ' + s.player.nationality : ''}
+                                        ${s.match_type ? '| ' + s.match_type : ''}
+                                        ${typeof s.score !== 'undefined' ? '| ' + s.score + '% match' : ''}
+                                        ${typeof s.career_score !== 'undefined' ? '| ' + Math.round(s.career_score) + ' career' : ''}
                                     </div>
                                 </div>
                             </div>
                         `).join('') : '<div class="no-suggestions">No suggestions found</div>'}
+                    </div>
+                    <div class="search-box">
+                        <input class="search-input" type="text" placeholder="Search player..."
+                               value="${escapeHtml(searchQueries[idx] || '')}"
+                               oninput="searchPlayers(${idx}, this.value)">
+                        <div class="search-results" id="search-results-${idx}">
+                            ${renderSearchResults(idx)}
+                        </div>
                     </div>
                     <div class="token-actions">
                         <button class="btn btn-no-match" onclick="selectPlayer(${idx}, null)">✗ No Match</button>
@@ -1234,6 +1304,53 @@ HTML_TEMPLATE = """
             });
             
             updateStats();
+        }
+
+        function renderSearchResults(idx) {
+            const results = searchResults[idx] || [];
+            const query = (searchQueries[idx] || '').trim();
+            if (!query) return '';
+            if (results.length === 0) {
+                return '<div class="no-suggestions">No matches</div>';
+            }
+            return results.slice(0, 8).map(r => `
+                <div class="search-result" onclick="selectPlayer(${idx}, '${escapeJs(r.name)}')">
+                    <div class="search-result-name">${escapeHtml(r.name)}</div>
+                    <div class="search-result-meta">
+                        ${r.player?.position || ''}
+                        ${r.player?.current_club ? '| ' + r.player.current_club : ''}
+                        ${r.player?.nationality ? '| ' + r.player.nationality : ''}
+                        ${typeof r.score !== 'undefined' ? '| ' + r.score + '% match' : ''}
+                        ${typeof r.career_score !== 'undefined' ? '| ' + Math.round(r.career_score) + ' career' : ''}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function searchPlayers(idx, query) {
+            searchQueries[idx] = query;
+            const target = document.getElementById(`search-results-${idx}`);
+            if (!target) return;
+            const trimmed = query.trim();
+            if (trimmed.length < 2) {
+                searchResults[idx] = [];
+                target.innerHTML = '';
+                return;
+            }
+            if (searchTimers[idx]) {
+                clearTimeout(searchTimers[idx]);
+            }
+            target.innerHTML = '<div class="no-suggestions">Searching...</div>';
+            searchTimers[idx] = setTimeout(async () => {
+                try {
+                    const resp = await fetch(`/api/search-players?q=${encodeURIComponent(trimmed)}`);
+                    const data = await resp.json();
+                    searchResults[idx] = data.results || [];
+                    target.innerHTML = renderSearchResults(idx);
+                } catch (e) {
+                    target.innerHTML = '<div class="no-suggestions">Search failed</div>';
+                }
+            }, 250);
         }
         
         async function selectPlayer(idx, playerName) {
@@ -1276,7 +1393,8 @@ HTML_TEMPLATE = """
         function proceedToStage3() {
             const matched = Object.values(selections).filter(s => s && s !== null).length;
             if (matched === 0) {
-                alert('Please select at least one player before proceeding to LLM verification!');
+                const results = document.getElementById('llm-results');
+                results.innerHTML = '<div style="color: #ff4444; text-align: center; padding: 50px;">Please select at least one player before proceeding.</div>';
                 return;
             }
             document.querySelector('[data-stage="2"]').classList.add('completed');
@@ -1287,7 +1405,8 @@ HTML_TEMPLATE = """
         async function runLLMCheck() {
             const selectedPlayers = Object.values(selections).filter(s => s && s !== null);
             if (selectedPlayers.length === 0) {
-                alert('No players selected!');
+                const results = document.getElementById('llm-results');
+                results.innerHTML = '<div style="color: #ff4444; text-align: center; padding: 50px;">No players selected.</div>';
                 return;
             }
             
@@ -1327,12 +1446,17 @@ HTML_TEMPLATE = """
         
         function renderLLMResults() {
             const container = document.getElementById('llm-results');
+            const summary = document.getElementById('llm-summary');
             container.innerHTML = '';
-            
+            let correct = 0;
+            let wrong = 0;
+
             Object.entries(llmResults).forEach(([name, result]) => {
                 const card = document.createElement('div');
                 const answer = result.answer === true || result.answer === 'true' || result.answer === 'yes';
                 const verdict = answer ? 'yes' : 'no';
+                if (answer) correct++;
+                else wrong++;
                 
                 card.className = `llm-card ${verdict}`;
                 card.innerHTML = `
@@ -1347,6 +1471,9 @@ HTML_TEMPLATE = """
                 `;
                 container.appendChild(card);
             });
+
+            summary.style.display = 'block';
+            summary.textContent = `✅ Correct: ${correct}   ❌ Incorrect: ${wrong}`;
         }
         
         // Export results
@@ -1652,7 +1779,7 @@ def _build_token_suggestions(tokens: List[Dict], matches: List[Dict]) -> Dict[in
     for idx, suggestions_dict in token_suggestions.items():
         sorted_suggestions = sorted(
             suggestions_dict.values(),
-            key=lambda s: (s.get("career_score") or 0),
+            key=lambda s: (s.get("career_score") or 0, s.get("score") or 0),
             reverse=True,
         )
         result[idx] = sorted_suggestions
@@ -1662,7 +1789,11 @@ def _build_token_suggestions(tokens: List[Dict], matches: List[Dict]) -> Dict[in
 def _run_stage2_matching(tokens: List[Dict]) -> Dict[int, List[Dict]]:
     if not STATE["player_db_path"] or not Path(STATE["player_db_path"]).exists():
         return {}
-    players_by_name, all_names = load_players(Path(STATE["player_db_path"]))
+    if STATE.get("players_by_name") and STATE.get("all_names"):
+        players_by_name = STATE["players_by_name"]
+        all_names = STATE["all_names"]
+    else:
+        players_by_name, all_names = load_players(Path(STATE["player_db_path"]))
     matches: List[Dict] = []
     search_cache: Dict[str, List[Dict]] = {}
     matches.extend(
@@ -1695,6 +1826,57 @@ def api_tokens():
         "tokens": tokens_with_suggestions,
         "selections": STATE["selections"]
     })
+
+
+@app.route("/api/search-players")
+def api_search_players():
+    """Search players by query string."""
+    query = (request.args.get("q") or "").strip()
+    if not query or len(query) < 2:
+        return jsonify({"results": []})
+
+    if not STATE["player_db_path"] or not Path(STATE["player_db_path"]).exists():
+        return jsonify({"results": []})
+
+    if not STATE.get("players_by_name") or not STATE.get("all_names"):
+        players_by_name, all_names = load_players(Path(STATE["player_db_path"]))
+        STATE["players_by_name"] = players_by_name
+        STATE["all_names"] = all_names
+    else:
+        players_by_name = STATE["players_by_name"]
+        all_names = STATE["all_names"]
+
+    norm_query = normalize(query)
+    if not norm_query:
+        return jsonify({"results": []})
+
+    matches = fuzzy_match(norm_query, all_names, limit=12, threshold=60)
+    results: List[Dict] = []
+    seen = set()
+    for matched_name, score in matches:
+        for player in players_by_name.get(matched_name, [])[:3]:
+            name = player.get("name") or player.get("full_name")
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            career_score = player.get("_career_score") or 0.0
+            results.append({
+                "name": name,
+                "match_type": "search",
+                "score": score,
+                "career_score": career_score,
+                "player": {
+                    "name": name,
+                    "full_name": player.get("full_name"),
+                    "nationality": player.get("nationality"),
+                    "position": player.get("position"),
+                    "current_club": player.get("current_club") or player.get("club"),
+                    "career_score": career_score,
+                },
+            })
+
+    results.sort(key=lambda s: (s.get("career_score") or 0, s.get("score") or 0), reverse=True)
+    return jsonify({"results": results})
 
 
 @app.route("/api/set-transcript", methods=["POST"])
@@ -1745,36 +1927,52 @@ def api_run_llm():
     players = data.get("players", [])
     question = data.get("question", "")
     
-    if not STATE["llm_client"]:
-        return jsonify({"status": "error", "error": "No LLM client configured"}), 400
-    
     results = {}
-    for player_name in players:
-        prompt = (
-            f"Answer the question for the single player below. "
-            f"Return strict JSON: {{\"answer\": true|false, \"justification\": \"...\"}}. "
-            f"Include years/dates if relevant.\n"
-            f"Question: {question}\n"
-            f"Player: {player_name}\n"
-        )
-        
-        try:
-            response = STATE["llm_client"].ask(prompt)
-            # Try to parse JSON response
+    if STATE["llm_client"]:
+        for player_name in players:
+            prompt = (
+                f"Answer the question for the single player below. "
+                f"Return strict JSON: {{\"answer\": true|false, \"justification\": \"...\"}}. "
+                f"Include years/dates if relevant.\n"
+                f"Question: {question}\n"
+                f"Player: {player_name}\n"
+            )
             try:
-                result = json.loads(response)
-            except:
-                # Fallback: extract answer and justification
-                result = {
-                    "answer": "true" in response.lower() or "yes" in response.lower(),
-                    "justification": response
+                response = STATE["llm_client"].ask(prompt)
+                try:
+                    result = json.loads(response)
+                except Exception:
+                    result = {
+                        "answer": "true" in response.lower() or "yes" in response.lower(),
+                        "justification": response,
+                    }
+                results[player_name] = result
+            except Exception as e:
+                results[player_name] = {
+                    "answer": False,
+                    "justification": f"Error: {str(e)}",
                 }
-            results[player_name] = result
+    else:
+        try:
+            all_valid, invalid_names, reasoning = verify_with_llm(
+                players,
+                question,
+                player_db=STATE.get("player_db"),
+                llm_provider=STATE.get("llm_provider") or "gemini",
+                model=STATE.get("llm_model"),
+            )
+            invalid_set = {n.lower() for n in invalid_names}
+            for player_name in players:
+                is_valid = player_name.lower() not in invalid_set
+                results[player_name] = {
+                    "answer": is_valid,
+                    "justification": (
+                        f"LLM says this player {'satisfies' if is_valid else 'does not satisfy'} the question. "
+                        f"Reasoning: {reasoning}"
+                    ),
+                }
         except Exception as e:
-            results[player_name] = {
-                "answer": False,
-                "justification": f"Error: {str(e)}"
-            }
+            return jsonify({"status": "error", "error": str(e)}), 500
     
     STATE["llm_results"] = results
     return jsonify({"status": "ok", "results": results})
@@ -1801,10 +1999,15 @@ def main():
     parser.add_argument("--question", help="Initial question")
     parser.add_argument("--whisper-model", default="large", help="Whisper model size")
     parser.add_argument("--llm-client", help="LLM client module:Class")
+    parser.add_argument("--llm-provider", default="gemini", choices=["gemini", "openai", "ollama", "anthropic"], help="LLM provider for stage 3")
+    parser.add_argument("--llm-model", help="LLM model name (provider-specific)")
     parser.add_argument("--port", type=int, default=5000, help="Port to run server on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--upload-dir", help="Directory to store uploaded videos")
     args = parser.parse_args()
+
+    if load_dotenv:
+        load_dotenv()
     
     STATE["player_db_path"] = args.player_db
     STATE["question"] = args.question or ""
@@ -1820,6 +2023,14 @@ def main():
             print(f"✓ Loaded LLM client: {args.llm_client}")
         except Exception as e:
             print(f"⚠ Warning: Could not load LLM client: {e}")
+
+    STATE["llm_provider"] = args.llm_provider
+    STATE["llm_model"] = args.llm_model
+    if args.player_db and Path(args.player_db).exists():
+        STATE["player_db"] = load_player_database(args.player_db)
+        players_by_name, all_names = load_players(Path(args.player_db))
+        STATE["players_by_name"] = players_by_name
+        STATE["all_names"] = all_names
     
     print(f"\n🚀 Starting integrated UI at http://{args.host}:{args.port}")
     print(f"   Player DB: {args.player_db}")

@@ -172,8 +172,10 @@ def _transcribe_with_gemini(audio_path: str, known_names: Optional[List[str]] = 
     except ImportError:
         raise RuntimeError("Install google-genai: pip install google-genai")
     
-    # Initialize client (uses GOOGLE_API_KEY env var)
-    client = genai.Client()
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GOOGLE_API_KEY env var for Gemini.")
+    client = genai.Client(api_key=api_key)
     
     # Build a conditioning prompt with known names
     name_examples = ""
@@ -634,8 +636,10 @@ def _verify_with_gemini(prompt: str, model: str) -> Tuple[bool, List[str], str]:
     except ImportError:
         raise RuntimeError("Install google-genai: pip install google-genai")
     
-    # Initialize client (uses GOOGLE_API_KEY env var)
-    client = genai.Client()
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GOOGLE_API_KEY env var for Gemini.")
+    client = genai.Client(api_key=api_key)
     
     response = client.models.generate_content(
         model=model,
